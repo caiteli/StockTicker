@@ -1,0 +1,26 @@
+# ===== Python / 构建产物 =====
+__pycache__/
+*.py[cod]
+*.spec
+
+# ===== PyInstaller 产物（单文件 EXE 体积大，不入库） =====
+build/
+dist/
+*.exe
+
+# 注：installer/src/ 下的 StockTicker.exe / Uninstall.exe / StockTickerSetup.exe
+# 以及 installer/src/build、installer/src/dist 也按上面规则被忽略。
+
+# ===== 项目私有数据（含本地记忆/配置，切勿泄露） =====
+.workbuddy/
+
+# ===== 系统/编辑器 =====
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+
+# ===== 虚拟环境（若存在） =====
+venv/
+.venv/
+env/
