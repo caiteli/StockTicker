@@ -8,6 +8,11 @@ build/
 dist/
 *.exe
 
+# ===== 构建临时目录 / 交付目录（由 do_build.py 生成，不入库） =====
+_b*/
+_deliver/
+installer/src/_b*/
+
 # 注：installer/src/ 下的 StockTicker.exe / Uninstall.exe / StockTickerSetup.exe
 # 以及 installer/src/build、installer/src/dist 也按上面规则被忽略。
 
