@@ -694,20 +694,26 @@ class EdgeBar(QWidget):
 
     def paintEvent(self, e):
         p = QPainter(self)
-        # 鼠标 hover 时略亮，否则用半透明灰
-        col = QColor(0x70, 0x70, 0x70, 220) if self._hovered else QColor(0x55, 0x55, 0x55, 170)
-        p.fillRect(self.rect(), col)
-        # 细高光线让用户能看出这是个交互控件
+        # 跟随主题：底色取主题边框色（半透），hover 时向主题文本色提亮
+        base = QColor(BORDER)
+        if self._hovered:
+            base = QColor(WHITE)
+            base.setAlpha(200)
+        else:
+            base.setAlpha(170)
+        p.fillRect(self.rect(), base)
+        # 细高光线（主题文本色，半透）让用户能看出这是个交互控件；
+        # 不论深/浅主题都保持一条可见的边，方便“贴边后找得回窗口”
+        hl = QColor(WHITE)
+        hl.setAlpha(150 if not self._hovered else 235)
         if self._side in ("left",):
-            p.fillRect(QRect(0, 0, 1, self.height()), QColor(0xCC, 0xCC, 0xCC, 200))
+            p.fillRect(QRect(0, 0, 1, self.height()), hl)
         elif self._side in ("right",):
-            p.fillRect(QRect(self.width() - 1, 0, 1, self.height()),
-                       QColor(0xCC, 0xCC, 0xCC, 200))
+            p.fillRect(QRect(self.width() - 1, 0, 1, self.height()), hl)
         elif self._side in ("top",):
-            p.fillRect(QRect(0, 0, self.width(), 1), QColor(0xCC, 0xCC, 0xCC, 200))
+            p.fillRect(QRect(0, 0, self.width(), 1), hl)
         elif self._side in ("bottom",):
-            p.fillRect(QRect(0, self.height() - 1, self.width(), 1),
-                       QColor(0xCC, 0xCC, 0xCC, 200))
+            p.fillRect(QRect(0, self.height() - 1, self.width(), 1), hl)
 
 
 # ----------------------------- 浮动窗口 -----------------------------
@@ -1053,6 +1059,9 @@ class Ticker(QWidget):
         for k, a in self.theme_actions.items():
             a.setChecked(k == name)
         self.update()
+        # 若当前正贴边显示着边缘条，同步刷新它的主题色
+        if self._edge_bar.isVisible():
+            self._edge_bar.update()
         save_config()
 
     def set_opacity(self, v):
@@ -1483,9 +1492,9 @@ class Ticker(QWidget):
             return
         b = bars[self._hover]
 
-        # 1) K线 竖直指示线 —— 仅在 K线 区域内部画
+        # 1) K线 竖直指示线 —— 仅在 K线 区域内部画（中性灰，深浅主题都可见）
         cx = self._kl["x"] + self._hover * self._kl["cw"] + self._kl["cw"] / 2
-        p.setPen(QPen(QColor(255, 255, 255, 200), 1, Qt.DashLine))
+        p.setPen(QPen(GREY, 1, Qt.DashLine))
         p.drawLine(int(cx), int(self._kl["y"]),
                    int(cx), int(self._kl["y"] + self._kl["h"]))
 
@@ -1538,13 +1547,14 @@ class Ticker(QWidget):
         lx = max(0, min(lx, win_w - tw))
         ly = max(0, min(ly, win_h - th))
 
-        # 5) 背景：橙色（涨色），深底白字，强烈对比；不论主题都一眼能看见
-        p.setBrush(QBrush(QColor(0xEF, 0x82, 0x2A, 240)))
-        p.setPen(QPen(QColor(0xFF, 0xFF, 0xFF, 230), 1))
+        # 5) 背景：跟随主题（面板色 + 主题描边），不抢眼、隐蔽优先；
+        #    不再用橙色，使悬停框与整体面板融为一体
+        p.setBrush(QBrush(PANEL))
+        p.setPen(QPen(BORDER, 1))
         p.drawRoundedRect(QRect(lx, ly, tw, th), 4, 4)
 
-        # 6) 文字：白字
-        p.setPen(QColor(0xFF, 0xFF, 0xFF))
+        # 6) 文字：主题文本色（深主题浅字 / 浅主题深字）
+        p.setPen(WHITE)
         p.drawText(QRect(lx, ly, tw, th // 2),
                    Qt.AlignCenter, txt_t)
         p.drawText(QRect(lx, ly + th // 2, tw, th // 2),
