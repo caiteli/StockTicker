@@ -24,7 +24,8 @@ from PySide6.QtCore import (
     Qt, QThread, Signal, QRect, QPoint, QSize, QTimer
 )
 from PySide6.QtGui import (
-    QPainter, QColor, QPen, QBrush, QFont, QPixmap, QIcon, QCursor, QAction
+    QPainter, QColor, QPen, QBrush, QFont, QFontMetrics,
+    QPixmap, QIcon, QCursor, QAction
 )
 import requests
 import json
@@ -606,9 +607,14 @@ def vk_to_key(vk):
 class EdgeBar(QWidget):
     """贴边时显示在屏幕边缘的灰色细条，鼠标进入立即唤出主窗口并隐藏自己。
 
-    设计：宽/高 6px 灰色半透，竖向时全屏高，横向时全屏宽。独立 QWidget
+    设计：6px 灰色半透，长度与主窗口保持一致（贴左/右时高度=窗口高度，
+    贴上/下时宽度=窗口宽度），位置也对齐到窗口边缘。独立 QWidget
     （非主窗口子控件）以便主窗口隐藏时仍可见。无任务栏入口（Qt.Tool），
     不抢焦点（WindowDoesNotAcceptFocus），始终置顶（StaysOnTopHint）。
+
+    防抖：show_at 后会启动一个短锁（默认 350ms），期间忽略 enterEvent，
+    避免「拖到边缘 → 主窗隐藏 → 灰条恰好落在光标下 → 立即又唤回主窗」
+    的来回抖动（用户反馈的「秒隐藏又秒触发」）。
     """
 
     # 静态引用当前 ticker，避免闭包内存泄漏
@@ -628,35 +634,50 @@ class EdgeBar(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         # 鼠标追踪，让 leaveEvent 能响应
         self.setMouseTracking(True)
-        # 防止 bar 把鼠标事件吃掉后透不过去
-        self.setAttribute(Qt.WA_NoMousePropagation, False)
         # hover/leave 都能触发
         self._hovered = False
+        self._lock = False
+        self._lock_timer = QTimer(self)
+        self._lock_timer.setSingleShot(True)
+        self._lock_timer.timeout.connect(self._unlock)
 
-    def show_at(self, side, screen_geom):
-        """在指定屏幕边的 6px 灰条位置显示。"""
+    def show_at(self, side, screen_geom, win_rect):
+        """在指定屏幕边显示 6px 灰条；长度/位置与主窗口 (win_rect) 对齐。"""
         self._side = side
         THICK = 6
         if side in ("left", "right"):
-            w = THICK
+            # 竖向：高度=窗口高度，y 对齐窗口顶部
+            h = win_rect.height()
+            y = win_rect.y()
             x = screen_geom.x() if side == "left" else screen_geom.x() + screen_geom.width() - THICK
-            self.setGeometry(x, screen_geom.y(), w, screen_geom.height())
+            self.setGeometry(x, y, THICK, h)
         else:  # top, bottom
-            h = THICK
+            # 横向：宽度=窗口宽度，x 对齐窗口左边
+            w = win_rect.width()
+            x = win_rect.x()
             y = screen_geom.y() if side == "top" else screen_geom.y() + screen_geom.height() - THICK
-            self.setGeometry(screen_geom.x(), y, screen_geom.width(), h)
+            self.setGeometry(x, y, w, THICK)
         self.show()
         self.raise_()
-        logging.debug(f"EdgeBar show at {side} ({self.x()},{self.y()} {self.width()}x{self.height()})")
+        # 启动防抖锁：刚吸附时若光标已压在灰条上，先别立刻唤回主窗
+        self._lock = True
+        self._lock_timer.start(350)
+        logging.debug(f"EdgeBar show at {side} ({self.x()},{self.y()} "
+                      f"{self.width()}x{self.height()}) lock={self._lock}")
+
+    def _unlock(self):
+        self._lock = False
 
     def enterEvent(self, e):
-        # 鼠标进入 bar：立即唤出主窗口
+        # 鼠标进入 bar：立即唤出主窗口（防抖锁解除后）
         self._hovered = True
+        if self._lock:
+            # 刚吸附期间忽略，避免「隐藏→立刻唤回」抖动
+            return
         t = EdgeBar._ticker_ref
         if t is None:
             return
-        logging.debug(f"EdgeBar enterEvent, calling show_main")
-        # 主窗口可能仍 visible (比如 minimize 状态) 或 hidden，统一走 toggle_visible 路径
+        logging.debug("EdgeBar enterEvent -> show_main")
         if not t.isVisible():
             t._undim()
             t.show()
@@ -1261,8 +1282,8 @@ class Ticker(QWidget):
             self.move(x, y)
         self._edge_side = None
         if snapped_side:
-            # 1) 先显示边缘灰条（位置提示），再隐藏主窗口
-            self._edge_bar.show_at(snapped_side, g)
+            # 1) 先显示边缘灰条（长度/位置与主窗口对齐），再隐藏主窗口
+            self._edge_bar.show_at(snapped_side, g, QRect(x, y, w, h))
             # 2) 隐藏主窗口
             self.hide()
         else:
@@ -1470,8 +1491,8 @@ class Ticker(QWidget):
 
         # 2) 数值框文本：时间戳 + OHLC，前缀 "▍" 标识这是悬停框
         txt_t = f"▍ {b['t']}   OHLC"
-        txt_o = (f"开 {_fmt(b['o'])}  高 {_fmt(b['h'])}  "
-                 f"低 {_fmt(b['l'])}  收 {_fmt(b['c'])}")
+        txt_o = (f"开 {self._fmt(b['o'])}  高 {self._fmt(b['h'])}  "
+                 f"低 {self._fmt(b['l'])}  收 {self._fmt(b['c'])}")
 
         # 3) 字号循环：保证框能放进「整窗」(不是 K线 区)
         win_w, win_h = self.width(), self.height()

@@ -29,3 +29,7 @@ Thumbs.db
 venv/
 .venv/
 env/
+
+# ===== 临时验证脚本/截图（不入库） =====
+_test_fixes.py
+_hover_orange.png
