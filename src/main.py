@@ -20,7 +20,9 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QMenu, QSystemTrayIcon,
     QInputDialog, QMessageBox
 )
-from PySide6.QtCore import Qt, QThread, Signal, QRect, QPoint, QSize
+from PySide6.QtCore import (
+    Qt, QThread, Signal, QRect, QPoint, QSize, QTimer, QAbstractNativeEventFilter
+)
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont, QPixmap, QIcon, QCursor, QAction
 )
@@ -204,6 +206,7 @@ def save_config():
         "kzoom": TICKER.kzoom if TICKER else 60,
         "active": TICKER.active if TICKER else 0,
         "stocks": dict(SECIDS),
+        "edge_hide": TICKER.edge_hide if TICKER else True,
     }
     if TICKER:
         cfg["pos"] = [TICKER.x(), TICKER.y()]
@@ -422,37 +425,30 @@ class Worker(QThread):
         self.updated.emit(payload)
 
 
-# ----------------------------- 全局热键线程 -----------------------------
-class HotkeyThread(QThread):
-    toggled = Signal()
+# ----------------------------- 全局热键（Ctrl+Alt+H） -----------------------------
+# 用 Qt 原生事件过滤器接收 WM_HOTKEY，比在子线程里手写 GetMessage 消息循环更稳：
+# 后者在 64 位下因 ctypes 未声明 argtypes，指针参数被截断成 32 位，导致消息读不出来、
+# 表现为「热键注册了却毫无反应」。
+class HotkeyFilter(QAbstractNativeEventFilter):
+    MOD_CONTROL = 2
+    MOD_ALT = 1
+    VK_H = 0x48
 
-    def __init__(self):
+    def __init__(self, callback):
         super().__init__()
-        self.running = True
-        self.user32 = ctypes.windll.user32
-        self.MOD_CONTROL = 2
-        self.MOD_ALT = 1
-        self.MOD_NOREPEAT = 0x4000
-        self.VK_H = 0x48
+        self._cb = callback
 
-    def run(self):
-        try:
-            if not self.user32.RegisterHotKey(None, 1,
-                                              self.MOD_CONTROL | self.MOD_ALT | self.MOD_NOREPEAT,
-                                              self.VK_H):
-                return
-            msg = ctypes.wintypes.MSG()
-            while self.running:
-                ret = self.user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-                if ret == 0 or ret == -1:
-                    break
-                if msg.message == 0x0312:  # WM_HOTKEY
-                    self.toggled.emit()
-                self.user32.TranslateMessage(ctypes.byref(msg))
-                self.user32.DispatchMessageW(ctypes.byref(msg))
-            self.user32.UnregisterHotKey(None, 1)
-        except Exception:
-            pass
+    def nativeEventFilter(self, eventType, message):
+        if eventType == "windows_generic_MSG":
+            try:
+                msg = ctypes.cast(
+                    message, ctypes.POINTER(ctypes.wintypes.MSG)
+                ).contents
+                if msg.message == 0x0312:   # WM_HOTKEY
+                    self._cb()
+            except Exception:
+                pass
+        return False
 
 
 # ----------------------------- 浮动窗口 -----------------------------
@@ -470,6 +466,12 @@ class Ticker(QWidget):
         self.kzoom = int(SETTINGS.get("kzoom", 60))   # K 线可见根数（滚轮缩放）
         self._hover = None       # 鼠标悬停的 K 线索引
         self._kl = None          # 最近一次 K 线绘制几何
+        self.edge_hide = bool(SETTINGS.get("edge_hide", True))  # 贴边自动隐藏
+        self._docked = False     # 当前是否已收起贴边
+        self._rest_geom = None   # 收起前的正常几何，用于恢复
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self._dock)
 
         self.setWindowFlags(
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
@@ -491,10 +493,19 @@ class Ticker(QWidget):
         self.worker.daemon = True
         self.worker.start()
 
-        self.hotkey = HotkeyThread()
-        self.hotkey.toggled.connect(self.toggle_visible)
-        self.hotkey.daemon = True
-        self.hotkey.start()
+        self.hotkey = None
+        self._hkm = HotkeyFilter(self.toggle_visible)
+        self.user32 = ctypes.windll.user32
+        try:
+            self.user32.RegisterHotKey(
+                int(self.winId()), 1,
+                self._hkm.MOD_CONTROL | self._hkm.MOD_ALT,
+                self._hkm.VK_H)
+        except Exception:
+            log_exc("RegisterHotKey")
+        app = QApplication.instance()
+        if app is not None:
+            app.installNativeEventFilter(self._hkm)
 
         self._build_context_menu()
         self._build_tray()
@@ -518,6 +529,12 @@ class Ticker(QWidget):
         a_k = QAction("切换 K 线显隐  (双击空白处)", self)
         a_k.triggered.connect(self.toggle_kline)
         menu.addAction(a_k)
+
+        a_edge = QAction("贴边自动隐藏", self)
+        a_edge.setCheckable(True)
+        a_edge.setChecked(self.edge_hide)
+        a_edge.triggered.connect(self.toggle_edge_hide)
+        menu.addAction(a_edge)
 
         a_help = QAction("操作说明…", self)
         a_help.triggered.connect(self.show_help)
@@ -661,9 +678,17 @@ class Ticker(QWidget):
         if self.isVisible():
             self.hide()
         else:
+            if self._docked:
+                self._undock()
             self.show()
             self.raise_()
             self.activateWindow()
+
+    def toggle_edge_hide(self):
+        self.edge_hide = not self.edge_hide
+        if not self.edge_hide and self._docked:
+            self._undock()
+        save_config()
 
     def toggle_kline(self):
         self.show_kline = not self.show_kline
@@ -679,6 +704,9 @@ class Ticker(QWidget):
             "    右键菜单「显示/隐藏」，或快捷键 Ctrl+Alt+H，或单击托盘图标。\n\n"
             "● 移动窗口\n"
             "    在窗口空白处（非 K 线悬停区）按住鼠标左键拖动。\n\n"
+            "● 边缘吸附 / 贴边隐藏\n"
+            "    拖到屏幕边缘附近会自动吸附对齐；鼠标离开窗口约 2.5 秒后自动\n"
+            "    收起贴边（仅留一条缝），鼠标移回去即滑回。右键「贴边自动隐藏」可开关。\n\n"
             "● 切换 K 线标的\n"
             "    双击某支股票所在行；高亮行即为当前显示 K 线的标的。\n\n"
             "● 显示 / 隐藏 K 线\n"
@@ -803,7 +831,16 @@ class Ticker(QWidget):
     def quit_app(self):
         save_config()
         self.worker.stop()
-        self.hotkey.running = False
+        try:
+            self.user32.UnregisterHotKey(int(self.winId()), 1)
+        except Exception:
+            pass
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.removeNativeEventFilter(self._hkm)
+            except Exception:
+                pass
         self.tray.hide()
         QApplication.instance().quit()
 
@@ -811,6 +848,8 @@ class Ticker(QWidget):
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
             # 单击仅用于拖拽（切换股票改为双击）
+            if self._docked:
+                self._undock()   # 收起状态下抓住缝隙拖动：先复位到正常位置
             self.dragging = True
             self.drag_offset = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
 
@@ -837,6 +876,7 @@ class Ticker(QWidget):
 
     def mouseReleaseEvent(self, e):
         if self.dragging and self._moved:
+            self._snap_to_edge()   # 拖到屏幕边缘附近自动吸附对齐
             save_config()   # 拖拽移动后保存窗口位置
         self.dragging = False
         self._moved = False
@@ -881,9 +921,82 @@ class Ticker(QWidget):
         if self._hover is not None:
             self._hover = None
             self.update()
+        # 鼠标离开且开启贴边隐藏：延时收起成「一条缝」贴边，移回去即恢复
+        if self.edge_hide and not self.dragging and not self._docked:
+            self._hide_timer.start(2500)
         super().leaveEvent(e)
 
-    # ---------- 绘制 ----------
+    def enterEvent(self, e):
+        # 鼠标回到窗口（含收起后的缝隙）：取消隐藏计时并复位到正常位置
+        if self._hide_timer.isActive():
+            self._hide_timer.stop()
+        if self._docked:
+            self._undock()
+        super().enterEvent(e)
+
+    # ---------- 边缘吸附 / 贴边自动隐藏 ----------
+    def _screen_geom(self):
+        """返回当前窗口所在屏幕的可用区域（避开任务栏）。"""
+        scr = self.screen()
+        if scr is not None:
+            return scr.availableGeometry()
+        return QApplication.primaryScreen().availableGeometry()
+
+    def _snap_to_edge(self):
+        """拖拽松手时若靠近某屏幕边（阈值内），则吸附对齐到该边。"""
+        g = self._screen_geom()
+        thr = 18
+        x, y = self.x(), self.y()
+        w, h = self.width(), self.height()
+        snapped = False
+        if x <= g.x() + thr:
+            x = g.x(); snapped = True
+        elif x + w >= g.x() + g.width() - thr:
+            x = g.x() + g.width() - w; snapped = True
+        if y <= g.y() + thr:
+            y = g.y(); snapped = True
+        elif y + h >= g.y() + g.height() - thr:
+            y = g.y() + g.height() - h; snapped = True
+        if snapped:
+            self.move(x, y)
+
+    def _dock(self):
+        """收起贴边：把窗口移出屏幕只留一条缝，鼠标移回缝上即恢复。"""
+        if self._docked or not self.edge_hide or self.dragging:
+            return
+        g = self._screen_geom()
+        self._rest_geom = self.geometry()
+        w, h = self.width(), self.height()
+        cxw = self.x() + w / 2
+        cyw = self.y() + h / 2
+        cxs = g.x() + g.width() / 2
+        cys = g.y() + g.height() / 2
+        sliver = max(4, int(6 * SCALE))
+        if abs(cxw - cxs) >= abs(cyw - cys):
+            # 贴左右：留一条缝在屏幕左缘/右缘
+            if cxw < cxs:
+                x = g.x() - w + sliver
+            else:
+                x = g.x() + g.width() - sliver
+            y = min(max(g.y(), self.y()), g.y() + g.height() - h)
+        else:
+            # 贴上下：留一条缝在屏幕上缘/下缘
+            if cyw < cys:
+                y = g.y() - h + sliver
+            else:
+                y = g.y() + g.height() - sliver
+            x = min(max(g.x(), self.x()), g.x() + g.width() - w)
+        self.move(int(x), int(y))
+        self._docked = True
+
+    def _undock(self):
+        """从收起状态恢复到正常位置。"""
+        if not self._docked:
+            return
+        if self._rest_geom is not None:
+            self.setGeometry(self._rest_geom)
+        self._docked = False
+        self._hide_timer.stop()
     def paintEvent(self, ev):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
@@ -1046,13 +1159,24 @@ class Ticker(QWidget):
                  f"低 {b['l']:.2f}  收 {b['c']:.2f}")
         p.setFont(QFont("Consolas", FS(9)))
         fm = p.fontMetrics()
-        tw = max(fm.horizontalAdvance(txt_t), fm.horizontalAdvance(txt_o)) + 14
-        th = int(30 * SCALE)
+        lh = fm.lineSpacing()
+        tw = max(fm.horizontalAdvance(txt_t), fm.horizontalAdvance(txt_o)) + 12
+        # 框高按字体实际行高计算（不再写死 30*SCALE），缩小时也能容纳两行文字
+        th = int(lh * 2 + 6)
+        # 水平：优先放光标右侧，超出窗口则翻到左侧；整体夹在窗口内避免被裁
         lx = int(cx) + 8
-        if lx + tw > self._kl["x"] + self._kl["w"]:
+        if lx + tw > W:
             lx = int(cx) - tw - 8
-        lx = max(self._kl["x"], lx)
+        if lx < 0:
+            lx = 0
+        if lx + tw > W:
+            lx = max(0, W - tw)
+        # 垂直：夹在 K 线区域内，避免超出后被窗口裁掉
         ly = int(top_y) + 2
+        if ly + th > bot_y:
+            ly = int(bot_y) - th
+        if ly < int(top_y):
+            ly = int(top_y)
         p.setBrush(QBrush(PANEL))
         p.setPen(QPen(BORDER, 1))
         p.drawRoundedRect(QRect(lx, ly, tw, th), 4, 4)
