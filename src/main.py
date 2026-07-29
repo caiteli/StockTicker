@@ -602,6 +602,93 @@ def vk_to_key(vk):
     return f"VK{vk:02X}"
 
 
+# ----------------------------- 边缘灰条（贴边位置提示）-----------------------------
+class EdgeBar(QWidget):
+    """贴边时显示在屏幕边缘的灰色细条，鼠标进入立即唤出主窗口并隐藏自己。
+
+    设计：宽/高 6px 灰色半透，竖向时全屏高，横向时全屏宽。独立 QWidget
+    （非主窗口子控件）以便主窗口隐藏时仍可见。无任务栏入口（Qt.Tool），
+    不抢焦点（WindowDoesNotAcceptFocus），始终置顶（StaysOnTopHint）。
+    """
+
+    # 静态引用当前 ticker，避免闭包内存泄漏
+    _ticker_ref = None
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._side = None
+        # 无标题栏、工具窗口（不显示在任务栏）、不抢焦点、始终置顶
+        self.setWindowFlags(
+            Qt.FramelessWindowHint
+            | Qt.Tool
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowDoesNotAcceptFocus
+        )
+        # 半透背景 —— paintEvent 自绘
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        # 鼠标追踪，让 leaveEvent 能响应
+        self.setMouseTracking(True)
+        # 防止 bar 把鼠标事件吃掉后透不过去
+        self.setAttribute(Qt.WA_NoMousePropagation, False)
+        # hover/leave 都能触发
+        self._hovered = False
+
+    def show_at(self, side, screen_geom):
+        """在指定屏幕边的 6px 灰条位置显示。"""
+        self._side = side
+        THICK = 6
+        if side in ("left", "right"):
+            w = THICK
+            x = screen_geom.x() if side == "left" else screen_geom.x() + screen_geom.width() - THICK
+            self.setGeometry(x, screen_geom.y(), w, screen_geom.height())
+        else:  # top, bottom
+            h = THICK
+            y = screen_geom.y() if side == "top" else screen_geom.y() + screen_geom.height() - THICK
+            self.setGeometry(screen_geom.x(), y, screen_geom.width(), h)
+        self.show()
+        self.raise_()
+        logging.debug(f"EdgeBar show at {side} ({self.x()},{self.y()} {self.width()}x{self.height()})")
+
+    def enterEvent(self, e):
+        # 鼠标进入 bar：立即唤出主窗口
+        self._hovered = True
+        t = EdgeBar._ticker_ref
+        if t is None:
+            return
+        logging.debug(f"EdgeBar enterEvent, calling show_main")
+        # 主窗口可能仍 visible (比如 minimize 状态) 或 hidden，统一走 toggle_visible 路径
+        if not t.isVisible():
+            t._undim()
+            t.show()
+        t.raise_()
+        t.activateWindow()
+        # 唤出后自己消失
+        self.hide()
+        # 清除 ticker's _edge_side 状态（防止 _snap_to_edge 误判）
+        if t._edge_side is not None:
+            t._edge_side = None
+
+    def leaveEvent(self, e):
+        self._hovered = False
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        # 鼠标 hover 时略亮，否则用半透明灰
+        col = QColor(0x70, 0x70, 0x70, 220) if self._hovered else QColor(0x55, 0x55, 0x55, 170)
+        p.fillRect(self.rect(), col)
+        # 细高光线让用户能看出这是个交互控件
+        if self._side in ("left",):
+            p.fillRect(QRect(0, 0, 1, self.height()), QColor(0xCC, 0xCC, 0xCC, 200))
+        elif self._side in ("right",):
+            p.fillRect(QRect(self.width() - 1, 0, 1, self.height()),
+                       QColor(0xCC, 0xCC, 0xCC, 200))
+        elif self._side in ("top",):
+            p.fillRect(QRect(0, 0, self.width(), 1), QColor(0xCC, 0xCC, 0xCC, 200))
+        elif self._side in ("bottom",):
+            p.fillRect(QRect(0, self.height() - 1, self.width(), 1),
+                       QColor(0xCC, 0xCC, 0xCC, 200))
+
+
 # ----------------------------- 浮动窗口 -----------------------------
 class Ticker(QWidget):
     def __init__(self):
@@ -616,6 +703,8 @@ class Ticker(QWidget):
         self.drag_offset = QPoint()
         self.kzoom = int(SETTINGS.get("kzoom", 60))   # K 线可见根数（滚轮缩放）
         self._hover = None       # 鼠标悬停的 K 线索引
+        self._hover_x = None     # 鼠标在 widget 内的 x（用于 hover 框定位）
+        self._hover_y = None     # 鼠标在 widget 内的 y
         self._kl = None          # 最近一次 K 线绘制几何
         self.auto_dim = bool(SETTINGS.get("auto_dim", True))  # 鼠标离开2秒自动变暗
         self._dimmed = False     # 当前是否已变暗（内容降到约10%可见）
@@ -658,6 +747,9 @@ class Ticker(QWidget):
         # 注册实例，供 save_config 读取实例级设置
         global TICKER
         TICKER = self
+        # 边缘灰条（位置提示），独立 QWidget，主窗口隐藏时仍可见
+        EdgeBar._ticker_ref = self
+        self._edge_bar = EdgeBar()
 
     # ---------- 尺寸 ----------
     def _apply_size(self):
@@ -888,10 +980,10 @@ class Ticker(QWidget):
             "● 显示 / 隐藏窗口\n"
             "    右键菜单「显示/隐藏」，或全局热键，右键菜单「设置热键…」可改。\n"
             f"    当前热键：{self.hotkey._combo_label()}\n\n"
-            "● 移动窗口 / 边缘隐藏\n"
+            "● 移动窗口 / 边缘自动隐藏\n"
             "    在窗口空白处按住鼠标左键拖动。拖到屏幕边缘附近会自动吸附对齐，\n"
-            "    并立即把整个窗口藏起来（不留任何残留色条或半透明残影）。\n"
-            "    重新唤出用热键、托盘单击、或右键「显示/隐藏」。\n\n"
+            "    同时整个窗口藏起来 —— 屏幕边缘留一条 6px 灰色细条作为位置提示。\n"
+            "    鼠标进入那条灰条，整窗立刻重新弹出。\n\n"
             "● 离开自动变暗\n"
             "    鼠标离开窗口约 2 秒后，整窗自动降到约 10% 透明度（无任何文字），\n"
             "    鼠标移回去即恢复。右键「离开自动变暗 (2秒)」可开关。\n\n"
@@ -905,8 +997,8 @@ class Ticker(QWidget):
             "● K 线缩放\n"
             "    鼠标在 K 线区域内滚动滚轮：向上滚放大（显示根数变少），向下滚缩小。\n\n"
             "● 查看单根数值\n"
-            "    鼠标移到 K 线任意位置，K 线区域右下角会显示该根的「时间戳 + OHLC」\n"
-            "    （橙色高亮框，不与 K 线 max/min 坐标混淆）。\n\n"
+            "    鼠标移到 K 线任意位置，**光标右上偏移 12px** 弹出橙色高亮框，\n"
+            "    内含「时间戳 + OHLC」；跟着鼠标走，不会被 K 线 max/min 坐标混淆。\n\n"
             "● 透明度 / 主题底色 / 窗口缩放\n"
             "    右键对应子菜单调整。\n\n"
             "● 添加 / 删除股票\n"
@@ -1042,25 +1134,38 @@ class Ticker(QWidget):
             if self._edge_side is not None:
                 self._edge_side = None
                 self.update()
+            # 拖拽时如果边缘 bar 还在显示，先藏掉
+            if self._edge_bar.isVisible():
+                self._edge_bar.hide()
             self.drag_offset = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
 
     def mouseMoveEvent(self, e):
+        # 总是记下光标位置（供 _draw_hover 画「跟手」框用）
+        self._hover_x = e.position().x()
+        self._hover_y = e.position().y()
         if self.dragging:
             self.move(e.globalPosition().toPoint() - self.drag_offset)
             self._moved = True
         # 鼠标在 K 线上方时显示该根数值
         if self.show_kline and self._kl and self._kl.get("bars"):
             kl = self._kl
-            gx, gy = e.position().x(), e.position().y()
-            if (kl["y"] - 14 <= gy <= kl["y"] + kl["h"]
-                    and kl["x"] <= gx <= kl["x"] + kl["w"]):
+            gx, gy = self._hover_x, self._hover_y
+            # 命中区用 K线 实际绘制区 (kl["y"] ~ kl["y"]+kl["h"])，不再向上扩 14，
+            # 避免与 K线 标签 / 标的行混淆；左右各扩 4px 兜底贴边错过
+            if (kl["y"] <= gy <= kl["y"] + kl["h"]
+                    and kl["x"] - 4 <= gx <= kl["x"] + kl["w"] + 4):
                 n = len(kl["bars"])
                 idx = int((gx - kl["x"]) / kl["cw"])
                 idx = max(0, min(n - 1, idx))
                 if self._hover != idx:
+                    logging.debug(f"hover -> idx={idx}/{n} "
+                                  f"(kl x={kl['x']:.0f} y={kl['y']:.0f} "
+                                  f"w={kl['w']:.0f} h={kl['h']:.0f} "
+                                  f"cursor=({gx:.0f},{gy:.0f}))")
                     self._hover = idx
                     self.update()
             elif self._hover is not None:
+                logging.debug(f"hover -> None (left K线, cursor=({gx:.0f},{gy:.0f}))")
                 self._hover = None
                 self.update()
         super().mouseMoveEvent(e)
@@ -1111,6 +1216,8 @@ class Ticker(QWidget):
     def leaveEvent(self, e):
         if self._hover is not None:
             self._hover = None
+            self._hover_x = None
+            self._hover_y = None
             self.update()
         # 鼠标离开且开启「离开自动变暗」：2 秒后降到约 10% 透明度（不贴边）
         if self.auto_dim and not self.dragging and not self._dimmed:
@@ -1134,8 +1241,9 @@ class Ticker(QWidget):
         return QApplication.primaryScreen().availableGeometry()
 
     def _snap_to_edge(self):
-        """拖拽松手时若靠近某屏幕边（阈值内），则吸附对齐到该边并直接 hide 整个窗口。
-        不画色条、不留 10% 透明度 —— 想要再唤出窗口就按热键/托盘/双击通知区域。"""
+        """拖拽松手时若靠近某屏幕边（阈值内），则吸附对齐到该边并隐藏主窗口。
+        同时在贴边一侧留一条 6px 灰色细条作位置提示（独立 EdgeBar widget），
+        鼠标进入 bar 立即唤回主窗口。"""
         g = self._screen_geom()
         thr = 18
         x, y = self.x(), self.y()
@@ -1151,10 +1259,16 @@ class Ticker(QWidget):
             y = g.y() + g.height() - h; snapped_side = "bottom"
         if snapped_side:
             self.move(x, y)
-        # 贴边 → 整窗隐藏（含托盘：用户用热键/托盘单击/右键显示-隐藏 重新唤出）
         self._edge_side = None
         if snapped_side:
+            # 1) 先显示边缘灰条（位置提示），再隐藏主窗口
+            self._edge_bar.show_at(snapped_side, g)
+            # 2) 隐藏主窗口
             self.hide()
+        else:
+            # 离开贴边状态：确保 bar 也藏起来
+            if self._edge_bar.isVisible():
+                self._edge_bar.hide()
 
     def _dim(self):
         """鼠标离开 2 秒后触发：把窗口整体透明度降到约 10%（不画任何文字，最安静）。"""
@@ -1336,9 +1450,11 @@ class Ticker(QWidget):
         p.drawText(QRect(x, y + h - 12, w, 12), Qt.AlignRight | Qt.AlignBottom, f"{mn:.2f}")
 
     def _draw_hover(self, p):
-        """K线悬停数值框：固定放在 K线 区域右下角内部（不挡柱），背景用对比强的橙色
-        让用户一眼能跟右上 max/右下 min 坐标标签区分开；字号循环到 5，OHLC 文字
-        在小窗口下走 elide 截断保证不超界。"""
+        """K线悬停数值框：画在「光标附近」而非固定在 K线 右下角 —— 跟手 + 永不混淆。
+
+        实测发现固定在右下角会被 K线 max/min 坐标标签 (7.52 / 6.21) 视觉混淆，
+        而且当窗口缩到很小、鼠标停在右边缘时，框会贴边被裁。改成跟随光标更直观。
+        """
         if self._hover is None or self._kl is None:
             return
         bars = self._kl["bars"]
@@ -1346,34 +1462,33 @@ class Ticker(QWidget):
             return
         b = bars[self._hover]
 
-        # 1) 在 K线 区域里画一根竖直指示线（不延伸到 K线 标签区之外，避免与名称重叠）
+        # 1) K线 竖直指示线 —— 仅在 K线 区域内部画
         cx = self._kl["x"] + self._hover * self._kl["cw"] + self._kl["cw"] / 2
-        p.setPen(QPen(QColor(120, 120, 120, 200), 1))
+        p.setPen(QPen(QColor(255, 255, 255, 200), 1, Qt.DashLine))
         p.drawLine(int(cx), int(self._kl["y"]),
                    int(cx), int(self._kl["y"] + self._kl["h"]))
 
-        # 2) 数值框文本：时间戳 + OHLC，加 "OHLC" 标签让它跟 K线 max/min 坐标明显区分
-        txt_t = f"{b['t']}   OHLC"
+        # 2) 数值框文本：时间戳 + OHLC，前缀 "▍" 标识这是悬停框
+        txt_t = f"▍ {b['t']}   OHLC"
         txt_o = (f"开 {_fmt(b['o'])}  高 {_fmt(b['h'])}  "
                  f"低 {_fmt(b['l'])}  收 {_fmt(b['c'])}")
 
-        # 3) 字号循环：起始 9，最小降到 5；用真实 boundingRect 算宽（horizontalAdvance 会低估 CJK 宽度）
+        # 3) 字号循环：保证框能放进「整窗」(不是 K线 区)
         win_w, win_h = self.width(), self.height()
         fs = 9
         while fs >= 5:
-            font = QFont("Microsoft YaHei", fs)   # 含中文，回退更稳
+            font = QFont("Microsoft YaHei", fs)
             fm = QFontMetrics(font)
             w_t = fm.boundingRect(0, 0, 10**6, 10**6,
                                   Qt.AlignLeft | Qt.TextSingleLine, txt_t).width()
             w_o = fm.boundingRect(0, 0, 10**6, 10**6,
                                   Qt.AlignLeft | Qt.TextSingleLine, txt_o).width()
-            tw = max(w_t, w_o) + 12
+            tw = max(w_t, w_o) + 14
             th = int(fm.lineSpacing() * 2 + 8)
             if tw <= win_w - 8 and th <= win_h - 8:
                 break
             fs -= 1
 
-        # 4) 极小窗口仍超宽：OHLC 文本走 elide 截断，tw 强制 ≤ win_w - 8
         p.setFont(QFont("Microsoft YaHei", fs))
         fm = p.fontMetrics()
         th = int(fm.lineSpacing() * 2 + 8)
@@ -1381,26 +1496,33 @@ class Ticker(QWidget):
                               Qt.AlignLeft | Qt.TextSingleLine, txt_t).width()
         w_o = fm.boundingRect(0, 0, 10**6, 10**6,
                               Qt.AlignLeft | Qt.TextSingleLine, txt_o).width()
-        tw_needed = max(w_t, w_o) + 12
+        tw_needed = max(w_t, w_o) + 14
         tw = min(tw_needed, win_w - 8)
         if tw_needed > tw:
             txt_t = fm.elidedText(txt_t, Qt.ElideRight, tw - 12)
             txt_o = fm.elidedText(txt_o, Qt.ElideRight, tw - 12)
 
-        # 5) 位置：固定放 K线 区域「右下角」内部（不挡柱）—— 不论 cx 在哪都可见
-        lx = self._kl["x"] + self._kl["w"] - tw - 2
-        ly = self._kl["y"] + self._kl["h"] - th - 2
-        if lx < self._kl["x"]:
-            lx = self._kl["x"]
-        if ly < self._kl["y"]:
-            ly = self._kl["y"]
+        # 4) 位置：光标右上偏移 12px —— 跟随鼠标，最直观
+        #    若越界则夹到 K线 区域右/下边界内；最终再夹到整窗内
+        mouse_x = int(self._hover_x) if self._hover_x is not None else int(cx)
+        mouse_y = int(self._hover_y) if self._hover_y is not None else int(self._kl["y"])
+        lx = mouse_x + 12
+        ly = mouse_y + 12
+        # 越界翻转
+        if lx + tw > self._kl["x"] + self._kl["w"]:
+            lx = mouse_x - tw - 12
+        if ly + th > self._kl["y"] + self._kl["h"]:
+            ly = mouse_y - th - 12
+        # 夹在整窗内
+        lx = max(0, min(lx, win_w - tw))
+        ly = max(0, min(ly, win_h - th))
 
-        # 6) 背景：橙色（涨色），深底白字，强烈对比；不论主题都一眼能看见
-        p.setBrush(QBrush(QColor(0xEF, 0x82, 0x2A, 235)))
-        p.setPen(QPen(QColor(0xFF, 0xFF, 0xFF, 220), 1))
+        # 5) 背景：橙色（涨色），深底白字，强烈对比；不论主题都一眼能看见
+        p.setBrush(QBrush(QColor(0xEF, 0x82, 0x2A, 240)))
+        p.setPen(QPen(QColor(0xFF, 0xFF, 0xFF, 230), 1))
         p.drawRoundedRect(QRect(lx, ly, tw, th), 4, 4)
 
-        # 7) 文字：白字，深浅主题下都清晰
+        # 6) 文字：白字
         p.setPen(QColor(0xFF, 0xFF, 0xFF))
         p.drawText(QRect(lx, ly, tw, th // 2),
                    Qt.AlignCenter, txt_t)
