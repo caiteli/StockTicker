@@ -888,9 +888,10 @@ class Ticker(QWidget):
             "● 显示 / 隐藏窗口\n"
             "    右键菜单「显示/隐藏」，或全局热键，右键菜单「设置热键…」可改。\n"
             f"    当前热键：{self.hotkey._combo_label()}\n\n"
-            "● 移动窗口 / 边缘吸附\n"
+            "● 移动窗口 / 边缘隐藏\n"
             "    在窗口空白处按住鼠标左键拖动。拖到屏幕边缘附近会自动吸附对齐，\n"
-            "    并在该边沿画一条小色条作为位置提示。\n\n"
+            "    并立即把整个窗口藏起来（不留任何残留色条或半透明残影）。\n"
+            "    重新唤出用热键、托盘单击、或右键「显示/隐藏」。\n\n"
             "● 离开自动变暗\n"
             "    鼠标离开窗口约 2 秒后，整窗自动降到约 10% 透明度（无任何文字），\n"
             "    鼠标移回去即恢复。右键「离开自动变暗 (2秒)」可开关。\n\n"
@@ -904,7 +905,8 @@ class Ticker(QWidget):
             "● K 线缩放\n"
             "    鼠标在 K 线区域内滚动滚轮：向上滚放大（显示根数变少），向下滚缩小。\n\n"
             "● 查看单根数值\n"
-            "    鼠标移到 K 线任意位置，自动显示该根的开 / 高 / 低 / 收。\n\n"
+            "    鼠标移到 K 线任意位置，K 线区域右下角会显示该根的「时间戳 + OHLC」\n"
+            "    （橙色高亮框，不与 K 线 max/min 坐标混淆）。\n\n"
             "● 透明度 / 主题底色 / 窗口缩放\n"
             "    右键对应子菜单调整。\n\n"
             "● 添加 / 删除股票\n"
@@ -1132,7 +1134,8 @@ class Ticker(QWidget):
         return QApplication.primaryScreen().availableGeometry()
 
     def _snap_to_edge(self):
-        """拖拽松手时若靠近某屏幕边（阈值内），则吸附对齐到该边。"""
+        """拖拽松手时若靠近某屏幕边（阈值内），则吸附对齐到该边并直接 hide 整个窗口。
+        不画色条、不留 10% 透明度 —— 想要再唤出窗口就按热键/托盘/双击通知区域。"""
         g = self._screen_geom()
         thr = 18
         x, y = self.x(), self.y()
@@ -1148,8 +1151,10 @@ class Ticker(QWidget):
             y = g.y() + g.height() - h; snapped_side = "bottom"
         if snapped_side:
             self.move(x, y)
-        # 记录贴边方向，paintEvent 据此画一条小色条作为位置提示
-        self._edge_side = snapped_side
+        # 贴边 → 整窗隐藏（含托盘：用户用热键/托盘单击/右键显示-隐藏 重新唤出）
+        self._edge_side = None
+        if snapped_side:
+            self.hide()
 
     def _dim(self):
         """鼠标离开 2 秒后触发：把窗口整体透明度降到约 10%（不画任何文字，最安静）。"""
@@ -1175,117 +1180,116 @@ class Ticker(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         self._kl = None
+        try:
+            rect = self.rect()
+            p.setBrush(QBrush(PANEL))
+            p.setPen(QPen(BORDER, 1))
+            p.drawRoundedRect(rect.adjusted(0, 0, -1, -1), 12, 12)
 
-        rect = self.rect()
-        p.setBrush(QBrush(PANEL))
-        p.setPen(QPen(BORDER, 1))
-        p.drawRoundedRect(rect.adjusted(0, 0, -1, -1), 12, 12)
-
-        # 各标的行
-        rm = int(12 * SCALE)
-        pw = int(118 * SCALE)
-        px = W - rm - pw
-        for i, secid in enumerate(ORDER):
-            y = TOP + i * ROW_H
-            if i == self.active:
-                p.setBrush(QBrush(HL))
+            # 各标的行
+            rm = int(12 * SCALE)
+            pw = int(118 * SCALE)
+            px = W - rm - pw
+            for i, secid in enumerate(ORDER):
+                y = TOP + i * ROW_H
+                if i == self.active:
+                    p.setBrush(QBrush(HL))
+                    p.setPen(Qt.NoPen)
+                    p.drawRoundedRect(QRect(6, y - 2, W - 12, ROW_H - 2), 7, 7)
                 p.setPen(Qt.NoPen)
-                p.drawRoundedRect(QRect(6, y - 2, W - 12, ROW_H - 2), 7, 7)
-            p.setPen(Qt.NoPen)
 
-            nm = SECIDS.get(secid) or secid
-            d = self.data.get(secid, {})
-            q = d.get("q")
-            if q and q.get("name"):
-                nm = q["name"]
+                nm = SECIDS.get(secid) or secid
+                d = self.data.get(secid, {})
+                q = d.get("q")
+                if q and q.get("name"):
+                    nm = q["name"]
 
-            # 名称
-            p.setPen(WHITE)
-            p.setFont(QFont("Microsoft YaHei", FS(12), QFont.Bold))
-            p.drawText(QRect(12, y, px - 18, ROW_H - 2),
-                       Qt.AlignLeft | Qt.AlignVCenter, nm)
-
-            # 价格 + 涨跌幅
-            if q and q.get("price") is not None:
-                # 二次防御：即便数据层漏转，这里也兜成数值，避免主线程绘制抛异常闪退
-                price = _num(q.get("price")) or 0.0
-                pct = _num(q.get("pct")) or 0.0
-                col = RED if pct >= 0 else GREEN
+                # 名称
                 p.setPen(WHITE)
-                p.setFont(QFont("Consolas", FS(13), QFont.Bold))
-                p.drawText(QRect(px, y, pw, ROW_H // 2),
-                           Qt.AlignRight | Qt.AlignVCenter,
-                           f"{price:.2f}")
-                p.setPen(col)
-                p.setFont(QFont("Consolas", FS(11)))
-                sign = "+" if pct >= 0 else ""
-                am = _num(q.get("chg")) or 0.0
-                ams = "+" if am >= 0 else ""
-                p.drawText(QRect(px - int(8 * SCALE), y + ROW_H // 2,
-                                 pw + int(8 * SCALE), ROW_H // 2),
-                           Qt.AlignRight | Qt.AlignVCenter,
-                           f"{sign}{pct:.2f}%  {ams}{am:.2f}")
-            else:
+                p.setFont(QFont("Microsoft YaHei", FS(12), QFont.Bold))
+                p.drawText(QRect(12, y, px - 18, ROW_H - 2),
+                           Qt.AlignLeft | Qt.AlignVCenter, nm)
+
+                # 价格 + 涨跌幅
+                if q and q.get("price") is not None:
+                    # 二次防御：即便数据层漏转，这里也兜成数值，避免主线程绘制抛异常闪退
+                    price = _num(q.get("price")) or 0.0
+                    pct = _num(q.get("pct")) or 0.0
+                    col = RED if pct >= 0 else GREEN
+                    p.setPen(WHITE)
+                    p.setFont(QFont("Consolas", FS(13), QFont.Bold))
+                    p.drawText(QRect(px, y, pw, ROW_H // 2),
+                               Qt.AlignRight | Qt.AlignVCenter,
+                               f"{price:.2f}")
+                    p.setPen(col)
+                    p.setFont(QFont("Consolas", FS(11)))
+                    sign = "+" if pct >= 0 else ""
+                    am = _num(q.get("chg")) or 0.0
+                    ams = "+" if am >= 0 else ""
+                    p.drawText(QRect(px - int(8 * SCALE), y + ROW_H // 2,
+                                     pw + int(8 * SCALE), ROW_H // 2),
+                               Qt.AlignRight | Qt.AlignVCenter,
+                               f"{sign}{pct:.2f}%  {ams}{am:.2f}")
+                else:
+                    p.setPen(GREY)
+                    p.setFont(QFont("Microsoft YaHei", FS(11)))
+                    p.drawText(QRect(px, y, pw, ROW_H - 2),
+                               Qt.AlignRight | Qt.AlignVCenter, "连接中…")
+
+            # K 线区域
+            if self.show_kline and ORDER:
+                kx = int(10 * SCALE)
+                ky = rows_h()
+                kw = W - int(20 * SCALE)
+                kh = H_KLINE - int(6 * SCALE)
+                active_secid = ORDER[self.active]
+                anm = SECIDS.get(active_secid) or active_secid
+                aq = self.data.get(active_secid, {}).get("q")
+                if aq and aq.get("name"):
+                    anm = aq["name"]
                 p.setPen(GREY)
-                p.setFont(QFont("Microsoft YaHei", FS(11)))
-                p.drawText(QRect(px, y, pw, ROW_H - 2),
-                           Qt.AlignRight | Qt.AlignVCenter, "连接中…")
-
-        # K 线区域
-        if self.show_kline and ORDER:
-            kx = int(10 * SCALE)
-            ky = rows_h()
-            kw = W - int(20 * SCALE)
-            kh = H_KLINE - int(6 * SCALE)
-            active_secid = ORDER[self.active]
-            anm = SECIDS.get(active_secid) or active_secid
-            aq = self.data.get(active_secid, {}).get("q")
-            if aq and aq.get("name"):
-                anm = aq["name"]
-            p.setPen(GREY)
-            p.setFont(QFont("Microsoft YaHei", FS(10)))
-            kn = self._klt_name()
-            klabel = kn if kn.endswith("K") else kn + "K"
-            p.drawText(QRect(kx, ky - int(4 * SCALE), kw, int(14 * SCALE)),
-                       Qt.AlignLeft | Qt.AlignVCenter,
-                       f"{anm}  ·  {klabel}")
-            bars = self.data.get(active_secid, {}).get("k") or []
-            if bars:
-                bars = bars[-self.kzoom:]
-            self._draw_kline(p, kx, ky + int(14 * SCALE), kw, kh - int(14 * SCALE), bars)
-            if bars:
-                n = len(bars)
-                self._kl = {
-                    "x": kx, "y": ky + int(14 * SCALE),
-                    "w": kw, "h": kh - int(14 * SCALE),
-                    "bars": bars, "cw": kw / n,
-                }
-                self._draw_hover(p)
-            else:
-                self._kl = None
-
-        # 变暗状态下：不画任何文字。已在 _dim() 里通过 setWindowOpacity(0.1)
-        # 把整窗透明度降到 10%，无需在此再绘制遮罩/文字。
-        # 边缘吸附时：在贴边一侧画一条小色条作为「位置提示」（无文字）。
-        if self._edge_side:
-            color = QColor(0x2A, 0x6E, 0xFF, 220)
-            bw = max(36, int(60 * SCALE))
-            bh = max(3, int(4 * SCALE))
-            Ww, Wh = self.width(), self.height()
-            if self._edge_side == "left":
-                p.fillRect(QRect(0, (Wh - bh) // 2, bw, bh), color)
-            elif self._edge_side == "right":
-                p.fillRect(QRect(Ww - bw, (Wh - bh) // 2, bw, bh), color)
-            elif self._edge_side == "top":
-                p.fillRect(QRect((Ww - bw) // 2, 0, bw, bh), color)
-            elif self._edge_side == "bottom":
-                p.fillRect(QRect((Ww - bw) // 2, Wh - bh, bw, bh), color)
-
-        p.end()
+                p.setFont(QFont("Microsoft YaHei", FS(10)))
+                kn = self._klt_name()
+                klabel = kn if kn.endswith("K") else kn + "K"
+                p.drawText(QRect(kx, ky - int(4 * SCALE), kw, int(14 * SCALE)),
+                           Qt.AlignLeft | Qt.AlignVCenter,
+                           f"{anm}  ·  {klabel}")
+                bars = self.data.get(active_secid, {}).get("k") or []
+                if bars:
+                    bars = bars[-self.kzoom:]
+                self._draw_kline(p, kx, ky + int(14 * SCALE),
+                                 kw, kh - int(14 * SCALE), bars)
+                if bars:
+                    n = len(bars)
+                    self._kl = {
+                        "x": kx, "y": ky + int(14 * SCALE),
+                        "w": kw, "h": kh - int(14 * SCALE),
+                        "bars": bars, "cw": kw / n,
+                    }
+                    self._draw_hover(p)
+                else:
+                    self._kl = None
+        finally:
+            p.end()
 
     def _klt_name(self):
         inv = {v: k for k, v in KLT_OPTIONS.items()}
         return inv.get(CURRENT_KLT, str(CURRENT_KLT))
+
+    @staticmethod
+    def _fmt(v):
+        """按价格量级自动选小数位：>=100 用 2 位，<100 用 3 位，指数 4 位。
+        避免 7.00 跟 7.000 跟 1234.5 跟 3289.47 各用 2 位时精度丢/难看。"""
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return str(v)
+        af = abs(f)
+        if af >= 1000:
+            return f"{f:.2f}"
+        if af >= 100:
+            return f"{f:.2f}"
+        return f"{f:.3f}"
 
     def _draw_kline(self, p, x, y, w, h, bars):
         if not bars:
@@ -1332,64 +1336,76 @@ class Ticker(QWidget):
         p.drawText(QRect(x, y + h - 12, w, 12), Qt.AlignRight | Qt.AlignBottom, f"{mn:.2f}")
 
     def _draw_hover(self, p):
+        """K线悬停数值框：固定放在 K线 区域右下角内部（不挡柱），背景用对比强的橙色
+        让用户一眼能跟右上 max/右下 min 坐标标签区分开；字号循环到 5，OHLC 文字
+        在小窗口下走 elide 截断保证不超界。"""
         if self._hover is None or self._kl is None:
             return
         bars = self._kl["bars"]
         if not (0 <= self._hover < len(bars)):
             return
         b = bars[self._hover]
+
+        # 1) 在 K线 区域里画一根竖直指示线（不延伸到 K线 标签区之外，避免与名称重叠）
         cx = self._kl["x"] + self._hover * self._kl["cw"] + self._kl["cw"] / 2
-        top_y = self._kl["y"]
-        bot_y = self._kl["y"] + self._kl["h"]
-        # 竖直指示线（深浅主题下均可见的中性灰）
-        p.setPen(QPen(QColor(150, 150, 150, 220), 1))
-        p.drawLine(int(cx), int(top_y), int(cx), int(bot_y))
-        # 数值框：显示该根时间戳 + OHLC；时间戳便于核对周期是否准确，底色跟随主题
-        txt_t = b["t"]
-        txt_o = (f"开 {b['o']:.2f}  高 {b['h']:.2f}  "
-                 f"低 {b['l']:.2f}  收 {b['c']:.2f}")
-        # 关键：用 boundingRect 算「真实宽度」。
-        # horizontalAdvance 对 CJK 字符在 Consolas(不含中文)回退到其它字体时
-        # 会低估宽度，导致"收 X.XX"这类长串实际渲染超出框右侧被裁。
-        def _text_w(font, text):
-            fm = QFontMetrics(font)
-            return fm.boundingRect(0, 0, 10**6, 10**6,
-                                   Qt.AlignLeft | Qt.TextSingleLine, text).width()
-        # 动态选字号：保证两行框能放进「整个窗口」宽高（小缩放下框比窗口大才会被裁）
+        p.setPen(QPen(QColor(120, 120, 120, 200), 1))
+        p.drawLine(int(cx), int(self._kl["y"]),
+                   int(cx), int(self._kl["y"] + self._kl["h"]))
+
+        # 2) 数值框文本：时间戳 + OHLC，加 "OHLC" 标签让它跟 K线 max/min 坐标明显区分
+        txt_t = f"{b['t']}   OHLC"
+        txt_o = (f"开 {_fmt(b['o'])}  高 {_fmt(b['h'])}  "
+                 f"低 {_fmt(b['l'])}  收 {_fmt(b['c'])}")
+
+        # 3) 字号循环：起始 9，最小降到 5；用真实 boundingRect 算宽（horizontalAdvance 会低估 CJK 宽度）
         win_w, win_h = self.width(), self.height()
-        fs = max(7, FS(10))
-        while fs >= 7:
-            font = QFont("Consolas", fs)
+        fs = 9
+        while fs >= 5:
+            font = QFont("Microsoft YaHei", fs)   # 含中文，回退更稳
             fm = QFontMetrics(font)
-            th = int(fm.lineSpacing() * 2 + 6)
-            tw = max(_text_w(font, txt_t), _text_w(font, txt_o)) + 14
-            if th <= win_h - 4 and tw <= win_w - 4:
+            w_t = fm.boundingRect(0, 0, 10**6, 10**6,
+                                  Qt.AlignLeft | Qt.TextSingleLine, txt_t).width()
+            w_o = fm.boundingRect(0, 0, 10**6, 10**6,
+                                  Qt.AlignLeft | Qt.TextSingleLine, txt_o).width()
+            tw = max(w_t, w_o) + 12
+            th = int(fm.lineSpacing() * 2 + 8)
+            if tw <= win_w - 8 and th <= win_h - 8:
                 break
             fs -= 1
-        p.setFont(QFont("Consolas", fs))
+
+        # 4) 极小窗口仍超宽：OHLC 文本走 elide 截断，tw 强制 ≤ win_w - 8
+        p.setFont(QFont("Microsoft YaHei", fs))
         fm = p.fontMetrics()
-        th = int(fm.lineSpacing() * 2 + 6)
-        tw = max(_text_w(p.font(), txt_t), _text_w(p.font(), txt_o)) + 14
-        # 水平：优先放光标右侧，超出窗口则翻到左侧；整体夹在窗口内避免被裁
-        lx = int(cx) + 8
-        if lx + tw > win_w:
-            lx = int(cx) - tw - 8
-        if lx < 0:
-            lx = 0
-        if lx + tw > win_w:
-            lx = max(0, win_w - tw)
-        # 垂直：优先放在 K 线「上方」不挡柱；越界则夹到窗口内（用整窗高度，不局限 K 线区）
-        ly = int(top_y) - th - 2
-        if ly < 0:
-            ly = int(bot_y) + 2
-        if ly + th > win_h:
-            ly = max(0, win_h - th)
-        p.setBrush(QBrush(PANEL))
-        p.setPen(QPen(BORDER, 1))
+        th = int(fm.lineSpacing() * 2 + 8)
+        w_t = fm.boundingRect(0, 0, 10**6, 10**6,
+                              Qt.AlignLeft | Qt.TextSingleLine, txt_t).width()
+        w_o = fm.boundingRect(0, 0, 10**6, 10**6,
+                              Qt.AlignLeft | Qt.TextSingleLine, txt_o).width()
+        tw_needed = max(w_t, w_o) + 12
+        tw = min(tw_needed, win_w - 8)
+        if tw_needed > tw:
+            txt_t = fm.elidedText(txt_t, Qt.ElideRight, tw - 12)
+            txt_o = fm.elidedText(txt_o, Qt.ElideRight, tw - 12)
+
+        # 5) 位置：固定放 K线 区域「右下角」内部（不挡柱）—— 不论 cx 在哪都可见
+        lx = self._kl["x"] + self._kl["w"] - tw - 2
+        ly = self._kl["y"] + self._kl["h"] - th - 2
+        if lx < self._kl["x"]:
+            lx = self._kl["x"]
+        if ly < self._kl["y"]:
+            ly = self._kl["y"]
+
+        # 6) 背景：橙色（涨色），深底白字，强烈对比；不论主题都一眼能看见
+        p.setBrush(QBrush(QColor(0xEF, 0x82, 0x2A, 235)))
+        p.setPen(QPen(QColor(0xFF, 0xFF, 0xFF, 220), 1))
         p.drawRoundedRect(QRect(lx, ly, tw, th), 4, 4)
-        p.setPen(WHITE)
-        p.drawText(QRect(lx, ly, tw, th // 2), Qt.AlignCenter, txt_t)
-        p.drawText(QRect(lx, ly + th // 2, tw, th // 2), Qt.AlignCenter, txt_o)
+
+        # 7) 文字：白字，深浅主题下都清晰
+        p.setPen(QColor(0xFF, 0xFF, 0xFF))
+        p.drawText(QRect(lx, ly, tw, th // 2),
+                   Qt.AlignCenter, txt_t)
+        p.drawText(QRect(lx, ly + th // 2, tw, th // 2),
+                   Qt.AlignCenter, txt_o)
 
 
 # ----------------------------- 入口 -----------------------------
