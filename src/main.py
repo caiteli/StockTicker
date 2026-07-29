@@ -26,6 +26,58 @@ from PySide6.QtGui import (
 )
 import requests
 import json
+import logging
+import traceback
+
+
+# ----------------------------- 崩溃 / 异常日志 -----------------------------
+# 把未捕获异常与 worker 报错写到 %APPDATA%\StockTicker\app.log，
+# 便于事后排查（尤其闪退类问题）。
+_LOG_DIR = os.path.join(
+    os.environ.get("APPDATA", os.path.expanduser("~")), "StockTicker"
+)
+try:
+    os.makedirs(_LOG_DIR, exist_ok=True)
+    logging.basicConfig(
+        filename=os.path.join(_LOG_DIR, "app.log"),
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        encoding="utf-8",
+    )
+except Exception:
+    pass
+
+def log_exc(tag=""):
+    """记录当前异常堆栈到日志文件。"""
+    try:
+        logging.error(f"{tag}: " + traceback.format_exc())
+    except Exception:
+        pass
+
+def _global_exc_hook(exc_type, exc_val, exc_tb):
+    try:
+        logging.error("UNCAUGHT: " + "".join(
+            traceback.format_exception(exc_type, exc_val, exc_tb)))
+    except Exception:
+        pass
+
+sys.excepthook = _global_exc_hook
+try:
+    threading.excepthook = lambda args: _global_exc_hook(
+        args.exc_type, args.exc_value, args.exc_traceback)
+except Exception:
+    pass
+
+
+def _num(v):
+    """把东方财富可能返回的 '-' / '--' / '' / None 统一转成 float 或 None，
+    避免字符串被当成数字传给绘制/比较时抛 TypeError 导致主线程闪退。"""
+    if v is None or v == "" or v == "-" or v == "--":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def resource_path(relative_path):
@@ -240,77 +292,87 @@ class Worker(QThread):
         )
 
     def fetch_quote(self, secid):
-        r = requests.get(self._quote_url(secid), headers=HEADERS, timeout=5)
+        # timeout=(connect, read)：避免某标的连接/读超时把整轮拖死
+        r = requests.get(self._quote_url(secid), headers=HEADERS, timeout=(3, 8))
         d = (r.json() or {}).get("data") or {}
         return {
             "name": d.get("f58"),
             "code": d.get("f57"),
-            "price": d.get("f43"),
-            "open": d.get("f46"),
-            "high": d.get("f44"),
-            "low": d.get("f45"),
-            "prev_close": d.get("f60"),
-            "pct": d.get("f170"),   # 涨跌幅 %
-            "chg": d.get("f169"),   # 涨跌额
+            "price": _num(d.get("f43")),
+            "open": _num(d.get("f46")),
+            "high": _num(d.get("f44")),
+            "low": _num(d.get("f45")),
+            "prev_close": _num(d.get("f60")),
+            "pct": _num(d.get("f170")),   # 涨跌幅 %
+            "chg": _num(d.get("f169")),   # 涨跌额
         }
 
     def fetch_kline(self, secid):
-        r = requests.get(self._kline_url(secid), headers=HEADERS, timeout=5)
+        r = requests.get(self._kline_url(secid), headers=HEADERS, timeout=(3, 8))
         kd = (r.json() or {}).get("data") or {}
         bars = []
         for s in (kd.get("klines") or []):
             p = s.split(",")
             if len(p) >= 6:
-                bars.append({
-                    "t": p[0],
-                    "o": float(p[1]),
-                    "c": float(p[2]),
-                    "h": float(p[3]),
-                    "l": float(p[4]),
-                    "v": float(p[5]),
-                })
+                try:
+                    bars.append({
+                        "t": p[0],
+                        "o": float(p[1]),
+                        "c": float(p[2]),
+                        "h": float(p[3]),
+                        "l": float(p[4]),
+                        "v": float(p[5]),
+                    })
+                except (TypeError, ValueError):
+                    # 单根数据异常（如停牌返回 '-'）跳过，不连累整图
+                    continue
         return bars
 
     def run(self):
         try:
             while self.running:
-                # 等待：到点（行情间隔）或被强制刷新信号即时唤醒（0.1s 粒度）
-                waited = 0.0
-                while waited < QUOTE_INTERVAL and self.running:
-                    if self.refresh_event.wait(0.1):
-                        break
-                    waited += 0.1
-                self.refresh_event.clear()
-                now = time.time()
+                try:
+                    # 等待：到点（行情间隔）或被强制刷新信号即时唤醒（0.1s 粒度）
+                    waited = 0.0
+                    while waited < QUOTE_INTERVAL and self.running:
+                        if self.refresh_event.wait(0.1):
+                            break
+                        waited += 0.1
+                    self.refresh_event.clear()
+                    now = time.time()
 
-                # 切换周期 / 增删标的：立即只拉「当前激活标的」K 线并刷新，
-                # 不再被其它标的行情抓取阻塞，保证切换后 K 线最快可见
-                if self.force_kline and ORDER:
-                    self._refresh_active_kline()
-                    self.force_kline = False
+                    # 切换周期 / 增删标的：立即只拉「当前激活标的」K 线并刷新，
+                    # 不再被其它标的行情抓取阻塞，保证切换后 K 线最快可见
+                    if self.force_kline and ORDER:
+                        self._refresh_active_kline()
+                        self.force_kline = False
 
-                # 行情：并发抓取（避免单标的超时拖累整体），缩短切换等待
-                do_k = (now - self.last_kline) >= KLINE_INTERVAL
-                qmap = self._fetch_all_quotes()
-                for secid, q in qmap.items():
-                    if q and q.get("price") is not None:
-                        if q.get("name"):
-                            SECIDS[secid] = q["name"]
-                        self.qcache[secid] = q
+                    # 行情：并发抓取（避免单标的超时拖累整体），缩短切换等待
+                    do_k = (now - self.last_kline) >= KLINE_INTERVAL
+                    qmap = self._fetch_all_quotes()
+                    for secid, q in qmap.items():
+                        if q and q.get("price") is not None:
+                            if q.get("name"):
+                                SECIDS[secid] = q["name"]
+                            self.qcache[secid] = q
 
-                # K 线：到点整体刷新
-                if do_k:
-                    self._fetch_all_klines()
-                    self.last_kline = now
+                    # K 线：到点整体刷新
+                    if do_k:
+                        self._fetch_all_klines()
+                        self.last_kline = now
 
-                # 组装并推送
-                payload = {}
-                for secid in list(SECIDS.keys()):
-                    payload[secid] = {
-                        "q": self.qcache.get(secid),
-                        "k": self.kcache.get(secid),
-                    }
-                self.updated.emit(payload)
+                    # 组装并推送
+                    payload = {}
+                    for secid in list(SECIDS.keys()):
+                        payload[secid] = {
+                            "q": self.qcache.get(secid),
+                            "k": self.kcache.get(secid),
+                        }
+                    self.updated.emit(payload)
+                except Exception:
+                    # 单轮出错只记录，绝不退出循环 —— 否则线程一死界面就冻结
+                    log_exc("worker iteration")
+                    time.sleep(1)
         finally:
             try:
                 self._qexec.shutdown(wait=False)
@@ -326,7 +388,7 @@ class Worker(QThread):
         out = {}
         for fut, s in futures.items():
             try:
-                out[s] = fut.result(timeout=5)
+                out[s] = fut.result(timeout=10)
             except Exception:
                 out[s] = None
         return out
@@ -858,17 +920,19 @@ class Ticker(QWidget):
 
             # 价格 + 涨跌幅
             if q and q.get("price") is not None:
-                pct = q.get("pct") or 0.0
+                # 二次防御：即便数据层漏转，这里也兜成数值，避免主线程绘制抛异常闪退
+                price = _num(q.get("price")) or 0.0
+                pct = _num(q.get("pct")) or 0.0
                 col = RED if pct >= 0 else GREEN
                 p.setPen(WHITE)
                 p.setFont(QFont("Consolas", FS(13), QFont.Bold))
                 p.drawText(QRect(px, y, pw, ROW_H // 2),
                            Qt.AlignRight | Qt.AlignVCenter,
-                           f"{q['price']:.2f}")
+                           f"{price:.2f}")
                 p.setPen(col)
                 p.setFont(QFont("Consolas", FS(11)))
                 sign = "+" if pct >= 0 else ""
-                am = q.get("chg") or 0.0
+                am = _num(q.get("chg")) or 0.0
                 ams = "+" if am >= 0 else ""
                 p.drawText(QRect(px - int(8 * SCALE), y + ROW_H // 2,
                                  pw + int(8 * SCALE), ROW_H // 2),
