@@ -4,7 +4,7 @@ StockTicker —— 极简置顶浮动行情小工具
 - 实时监控：默认 长安汽车 / 上证指数 / 创业板指（可在右键菜单增删）
 - 无边框、置顶、可拖拽、可隐藏到托盘
 - 迷你 K 线（右键可切换 1分/5分/15分/30分/60分/日K/周K）
-- 全局热键 Ctrl+Alt+H 隐藏/显示
+- 全局热键 Ctrl+Alt+; 隐藏/显示（可在右键菜单「设置热键…」修改）
 数据源：东方财富公开行情接口（无需密钥）
 """
 
@@ -207,6 +207,8 @@ def save_config():
         "active": TICKER.active if TICKER else 0,
         "stocks": dict(SECIDS),
         "auto_dim": TICKER.auto_dim if TICKER else True,
+        "hotkey_mod": TICKER.hotkey._mod if TICKER else HotkeyThread.DEFAULT_MOD,
+        "hotkey_vk": TICKER.hotkey._vk if TICKER else HotkeyThread.DEFAULT_VK,
     }
     if TICKER:
         cfg["pos"] = [TICKER.x(), TICKER.y()]
@@ -425,23 +427,34 @@ class Worker(QThread):
         self.updated.emit(payload)
 
 
-# ----------------------------- 全局热键（Ctrl+Alt+H） -----------------------------
+# ----------------------------- 全局热键 -----------------------------
 # 独立线程跑 Windows 消息循环接收 WM_HOTKEY。
 # 关键：必须显式声明 RegisterHotKey / GetMessageW 等的 argtypes/restype，
 # 否则 64 位下指针参数被截断成 32 位，导致 WM_HOTKEY 消息读不出来、
 # 表现为「热键注册了却毫无反应」（这是上一版热键失效的根因）。
 # 用 NULL 窗口句柄注册，消息进入线程队列，不依赖 widget 的 winId()。
+#
+# 默认热键 Ctrl+Alt+;（分号）。旧的 Ctrl+Alt+H 在很多机器上被 QQ/微信
+# /系统截图等占用，RegisterHotKey 持续返回 False。改成不冲突的默认组合，
+# 并在右键菜单提供「设置热键…」让用户可自定义。
 class HotkeyThread(QThread):
     toggled = Signal()
     MOD_CONTROL = 0x0002
     MOD_ALT = 0x0001
+    MOD_SHIFT = 0x0004
+    MOD_WIN = 0x0008
     MOD_NOREPEAT = 0x4000
-    VK_H = 0x48
     WM_HOTKEY = 0x0312
+    # 默认 Ctrl+Alt+;（VK_OEM_1 = 0xBA）
+    DEFAULT_MOD = MOD_CONTROL | MOD_ALT
+    DEFAULT_VK = 0xBA
 
-    def __init__(self):
+    def __init__(self, modifiers=None, vk=None):
         super().__init__()
         self.running = True
+        self._mod = self.DEFAULT_MOD if modifiers is None else modifiers
+        self._vk = self.DEFAULT_VK if vk is None else vk
+        self._lock = threading.Lock()
         self.user32 = ctypes.windll.user32
         # 显式声明类型，避免 64 位指针截断
         self.user32.RegisterHotKey.argtypes = [
@@ -466,12 +479,21 @@ class HotkeyThread(QThread):
             ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM]
         self.user32.PostThreadMessageW.restype = ctypes.wintypes.BOOL
 
+    def _combo_label(self):
+        """人类可读的当前热键描述，例如 'Ctrl+Alt+;'。"""
+        parts = []
+        m = self._mod
+        if m & self.MOD_CONTROL: parts.append("Ctrl")
+        if m & self.MOD_ALT: parts.append("Alt")
+        if m & self.MOD_SHIFT: parts.append("Shift")
+        if m & self.MOD_WIN: parts.append("Win")
+        return "+".join(parts) + "+" + vk_to_key(self._vk)
+
     def run(self):
         try:
             if not self.user32.RegisterHotKey(
                     None, 1,
-                    self.MOD_CONTROL | self.MOD_ALT | self.MOD_NOREPEAT,
-                    self.VK_H):
+                    self._mod | self.MOD_NOREPEAT, self._vk):
                 # 返回失败：热键可能被占用，或无桌面会话（如 headless 环境）。
                 # 此时退化为「右键菜单 / 托盘单击」也能显隐，不影响其它功能。
                 logging.warning(
@@ -494,15 +516,90 @@ class HotkeyThread(QThread):
         except Exception:
             log_exc("hotkey loop")
 
+    def set_combo(self, modifiers, vk):
+        """线程安全地切换热键组合：先让当前消息循环退出，再启动新线程。"""
+        with self._lock:
+            try:
+                self.user32.PostThreadMessageW(
+                    ctypes.wintypes.DWORD(self.currentThreadId()),
+                    0x0012, 0, 0)   # WM_QUIT 让 GetMessageW 返回 0
+            except Exception:
+                pass
+            self.running = False
+            try:
+                self.wait(2000)
+            except Exception:
+                pass
+            self._mod = modifiers
+            self._vk = vk
+            self.running = True
+            # Qt 不允许在已 start 的线程上再 start；用 start() 重启
+            try:
+                self.start()
+            except Exception:
+                log_exc("hotkey restart")
+
     def stop(self):
         self.running = False
         try:
-            # 让阻塞在 GetMessage 的线程退出循环
             self.user32.PostThreadMessageW(
                 ctypes.wintypes.DWORD(self.currentThreadId()),
-                0x0012, 0, 0)   # WM_QUIT
+                0x0012, 0, 0)
         except Exception:
             pass
+
+
+# ----------------------------- 热键字符串 <-> Win32 码 解析 -----------------------------
+# 支持 Ctrl/Alt/Shift/Win 修饰键 + 主键（字母/数字/F1-F12/常用标点）
+_HOTKEY_KEY_MAP = {}
+for _ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+    _HOTKEY_KEY_MAP[_ch] = ord(_ch)
+for _ch in "0123456789":
+    _HOTKEY_KEY_MAP[_ch] = ord(_ch)
+for _i in range(1, 13):
+    _HOTKEY_KEY_MAP[f"F{_i}"] = 0x6F + _i   # F1=0x70
+# 标点（与常见键盘一致；不要求全，按需扩展）
+_HOTKEY_KEY_MAP.update({
+    ";": 0xBA, "=": 0xBB, ",": 0xBC, "-": 0xBD, ".": 0xBE, "/": 0xBF,
+    "`": 0xC0, "[": 0xDB, "\\": 0xDC, "]": 0xDD, "'": 0xDE,
+})
+
+
+def parse_hotkey(text):
+    """把 'Ctrl+Alt+;' 解析为 (mod, vk)。失败返回 None。"""
+    if not text:
+        return None
+    text = text.strip()
+    mod = 0
+    main = None
+    for part in [p.strip() for p in text.split("+") if p.strip()]:
+        u = part.upper()
+        if u in ("CTRL", "CONTROL"):
+            mod |= HotkeyThread.MOD_CONTROL
+        elif u == "ALT":
+            mod |= HotkeyThread.MOD_ALT
+        elif u == "SHIFT":
+            mod |= HotkeyThread.MOD_SHIFT
+        elif u in ("WIN", "META", "SUPER"):
+            mod |= HotkeyThread.MOD_WIN
+        else:
+            # 主键：保持原始大小写去查表（如 'F1' 用大写，';' 保留原样）
+            key = part if len(part) > 1 else part.upper()
+            if key in _HOTKEY_KEY_MAP:
+                main = _HOTKEY_KEY_MAP[key]
+            else:
+                return None
+    if main is None or mod == 0:
+        return None
+    return mod, main
+
+
+def vk_to_key(vk):
+    """把 vk 码转回人类可读的主键字符（用于状态显示）。"""
+    for k, v in _HOTKEY_KEY_MAP.items():
+        if v == vk:
+            return k
+    return f"VK{vk:02X}"
 
 
 # ----------------------------- 浮动窗口 -----------------------------
@@ -522,6 +619,7 @@ class Ticker(QWidget):
         self._kl = None          # 最近一次 K 线绘制几何
         self.auto_dim = bool(SETTINGS.get("auto_dim", True))  # 鼠标离开2秒自动变暗
         self._dimmed = False     # 当前是否已变暗（内容降到约10%可见）
+        self._edge_side = None   # 边缘吸附方向："left"/"right"/"top"/"bottom"/None
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self._dim)
@@ -546,8 +644,10 @@ class Ticker(QWidget):
         self.worker.daemon = True
         self.worker.start()
 
-        # 全局热键 Ctrl+Alt+H：独立线程跑消息循环（详见 HotkeyThread）
-        self.hotkey = HotkeyThread()
+        # 全局热键：从配置读取自定义组合；默认 Ctrl+Alt+;（避免 Ctrl+Alt+H 被 QQ/截图等占用）
+        hk_mod = int(SETTINGS.get("hotkey_mod", HotkeyThread.DEFAULT_MOD))
+        hk_vk = int(SETTINGS.get("hotkey_vk", HotkeyThread.DEFAULT_VK))
+        self.hotkey = HotkeyThread(hk_mod, hk_vk)
         self.hotkey.toggled.connect(self.toggle_visible)
         self.hotkey.daemon = True
         self.hotkey.start()
@@ -567,9 +667,13 @@ class Ticker(QWidget):
     def _build_context_menu(self):
         menu = QMenu(self)
 
-        a_show = QAction("显示 / 隐藏  (Ctrl+Alt+H)", self)
+        a_show = QAction("显示 / 隐藏", self)
         a_show.triggered.connect(self.toggle_visible)
         menu.addAction(a_show)
+
+        a_hk = QAction(f"设置热键…  ({self.hotkey._combo_label()})", self)
+        a_hk.triggered.connect(self.set_hotkey_dialog)
+        menu.addAction(a_hk)
 
         a_k = QAction("切换 K 线显隐  (双击空白处)", self)
         a_k.triggered.connect(self.toggle_kline)
@@ -734,6 +838,43 @@ class Ticker(QWidget):
             self._undim()
         save_config()
 
+    def set_hotkey_dialog(self):
+        """弹输入框让用户改全局热键：例如 'Ctrl+Alt+;' 'Ctrl+Shift+F1'。"""
+        cur = self.hotkey._combo_label()
+        text, ok = QInputDialog.getText(
+            self, "设置热键",
+            "输入新的热键组合，例如：\n"
+            "  Ctrl+Alt+;\n"
+            "  Ctrl+Shift+F1\n"
+            "  Alt+Z\n\n"
+            "支持的修饰键：Ctrl / Alt / Shift / Win\n"
+            "支持的主键：A-Z / 0-9 / F1-F12 / ; , . / - = [ ] \\ ` ' \n\n"
+            f"当前热键：{cur}")
+        if not ok or not text.strip():
+            return
+        parsed = parse_hotkey(text)
+        if not parsed:
+            QMessageBox.warning(
+                self, "格式错误",
+                "无法识别该组合。请参考示例：Ctrl+Alt+;  /  Ctrl+Shift+F1")
+            return
+        mod, vk = parsed
+        self.set_hotkey(mod, vk)
+
+    def set_hotkey(self, modifiers, vk):
+        """真正切换热键：原线程退出 WM_QUIT → 等待退出 → 改参 → 重启。"""
+        try:
+            self.hotkey.set_combo(modifiers, vk)
+        except Exception:
+            log_exc("set_hotkey")
+            return
+        save_config()
+        # 重建菜单，让 "设置热键…" 行的当前组合文字同步更新
+        self._build_context_menu()
+        self._build_tray()
+        label = self.hotkey._combo_label()
+        QMessageBox.information(self, "已设置", f"新热键：{label}\n如仍不生效，看 app.log 的 RegisterHotKey 失败原因。")
+
     def toggle_kline(self):
         self.show_kline = not self.show_kline
         self._apply_size()
@@ -745,13 +886,14 @@ class Ticker(QWidget):
         text = (
             "【StockTicker 操作说明】\n\n"
             "● 显示 / 隐藏窗口\n"
-            "    右键菜单「显示/隐藏」，或快捷键 Ctrl+Alt+H，或单击托盘图标。\n\n"
-            "● 移动窗口\n"
-            "    在窗口空白处（非 K 线悬停区）按住鼠标左键拖动。\n\n"
-            "● 边缘吸附 / 离开自动变暗\n"
-            "    拖到屏幕边缘附近会自动吸附对齐；鼠标离开窗口约 2 秒后自动\n"
-            "    降到约 10% 透明度（内容变暗并显示提示条），鼠标移回去即恢复。\n"
-            "    右键「离开自动变暗 (2秒)」可开关。\n\n"
+            "    右键菜单「显示/隐藏」，或全局热键，右键菜单「设置热键…」可改。\n"
+            f"    当前热键：{self.hotkey._combo_label()}\n\n"
+            "● 移动窗口 / 边缘吸附\n"
+            "    在窗口空白处按住鼠标左键拖动。拖到屏幕边缘附近会自动吸附对齐，\n"
+            "    并在该边沿画一条小色条作为位置提示。\n\n"
+            "● 离开自动变暗\n"
+            "    鼠标离开窗口约 2 秒后，整窗自动降到约 10% 透明度（无任何文字），\n"
+            "    鼠标移回去即恢复。右键「离开自动变暗 (2秒)」可开关。\n\n"
             "● 切换 K 线标的\n"
             "    双击某支股票所在行；高亮行即为当前显示 K 线的标的。\n\n"
             "● 显示 / 隐藏 K 线\n"
@@ -894,6 +1036,10 @@ class Ticker(QWidget):
         if e.button() == Qt.LeftButton:
             # 单击仅用于拖拽（切换股票改为双击）
             self.dragging = True
+            # 开始拖拽：清除贴边提示条（松手时根据新位置重判）
+            if self._edge_side is not None:
+                self._edge_side = None
+                self.update()
             self.drag_offset = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
 
     def mouseMoveEvent(self, e):
@@ -991,31 +1137,40 @@ class Ticker(QWidget):
         thr = 18
         x, y = self.x(), self.y()
         w, h = self.width(), self.height()
-        snapped = False
+        snapped_side = None
         if x <= g.x() + thr:
-            x = g.x(); snapped = True
+            x = g.x(); snapped_side = "left"
         elif x + w >= g.x() + g.width() - thr:
-            x = g.x() + g.width() - w; snapped = True
+            x = g.x() + g.width() - w; snapped_side = "right"
         if y <= g.y() + thr:
-            y = g.y(); snapped = True
+            y = g.y(); snapped_side = "top"
         elif y + h >= g.y() + g.height() - thr:
-            y = g.y() + g.height() - h; snapped = True
-        if snapped:
+            y = g.y() + g.height() - h; snapped_side = "bottom"
+        if snapped_side:
             self.move(x, y)
+        # 记录贴边方向，paintEvent 据此画一条小色条作为位置提示
+        self._edge_side = snapped_side
 
     def _dim(self):
-        """鼠标离开 2 秒后触发：进入变暗状态（内容降到约 10% 可见），并显示提示条。"""
+        """鼠标离开 2 秒后触发：把窗口整体透明度降到约 10%（不画任何文字，最安静）。"""
         if self._dimmed or not self.auto_dim or self.dragging:
             return
         self._dimmed = True
-        self.update()
+        # 直接调窗口透明度，比在 paintEvent 里画遮罩更平滑、且不出现文字提示
+        try:
+            self.setWindowOpacity(0.1)
+        except Exception:
+            log_exc("setWindowOpacity dim")
 
     def _undim(self):
         """从变暗状态恢复。"""
         if not self._dimmed:
             return
         self._dimmed = False
-        self.update()
+        try:
+            self.setWindowOpacity(self.opacity)
+        except Exception:
+            log_exc("setWindowOpacity undim")
     def paintEvent(self, ev):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
@@ -1109,23 +1264,22 @@ class Ticker(QWidget):
             else:
                 self._kl = None
 
-        # 变暗状态：覆盖一层半透明遮罩把内容降到约 10% 可见，并在顶部画醒目提示条
-        if self._dimmed:
-            p.setBrush(QBrush(QColor(8, 9, 12, 224)))
-            p.setPen(Qt.NoPen)
-            p.drawRoundedRect(rect.adjusted(0, 0, -1, -1), 12, 12)
-            hint = "已隐藏 · 鼠标移入窗口恢复"
-            p.setFont(QFont("Microsoft YaHei", FS(11), QFont.Bold))
-            fm = p.fontMetrics()
-            hw = fm.horizontalAdvance(hint) + 22
-            hh = int(22 * SCALE)
-            hx = max(4, (W - hw) // 2)
-            hy = 4
-            p.setBrush(QBrush(QColor(0x2A, 0x6E, 0xFF, 235)))
-            p.setPen(Qt.NoPen)
-            p.drawRoundedRect(QRect(hx, hy, hw, hh), 6, 6)
-            p.setPen(QColor(255, 255, 255, 255))
-            p.drawText(QRect(hx, hy, hw, hh), Qt.AlignCenter, hint)
+        # 变暗状态下：不画任何文字。已在 _dim() 里通过 setWindowOpacity(0.1)
+        # 把整窗透明度降到 10%，无需在此再绘制遮罩/文字。
+        # 边缘吸附时：在贴边一侧画一条小色条作为「位置提示」（无文字）。
+        if self._edge_side:
+            color = QColor(0x2A, 0x6E, 0xFF, 220)
+            bw = max(36, int(60 * SCALE))
+            bh = max(3, int(4 * SCALE))
+            Ww, Wh = self.width(), self.height()
+            if self._edge_side == "left":
+                p.fillRect(QRect(0, (Wh - bh) // 2, bw, bh), color)
+            elif self._edge_side == "right":
+                p.fillRect(QRect(Ww - bw, (Wh - bh) // 2, bw, bh), color)
+            elif self._edge_side == "top":
+                p.fillRect(QRect((Ww - bw) // 2, 0, bw, bh), color)
+            elif self._edge_side == "bottom":
+                p.fillRect(QRect((Ww - bw) // 2, Wh - bh, bw, bh), color)
 
         p.end()
 
@@ -1194,36 +1348,42 @@ class Ticker(QWidget):
         txt_t = b["t"]
         txt_o = (f"开 {b['o']:.2f}  高 {b['h']:.2f}  "
                  f"低 {b['l']:.2f}  收 {b['c']:.2f}")
+        # 关键：用 boundingRect 算「真实宽度」。
+        # horizontalAdvance 对 CJK 字符在 Consolas(不含中文)回退到其它字体时
+        # 会低估宽度，导致"收 X.XX"这类长串实际渲染超出框右侧被裁。
+        def _text_w(font, text):
+            fm = QFontMetrics(font)
+            return fm.boundingRect(0, 0, 10**6, 10**6,
+                                   Qt.AlignLeft | Qt.TextSingleLine, text).width()
         # 动态选字号：保证两行框能放进「整个窗口」宽高（小缩放下框比窗口大才会被裁）
+        win_w, win_h = self.width(), self.height()
         fs = max(7, FS(10))
         while fs >= 7:
-            p.setFont(QFont("Consolas", fs))
-            fm = p.fontMetrics()
+            font = QFont("Consolas", fs)
+            fm = QFontMetrics(font)
             th = int(fm.lineSpacing() * 2 + 6)
-            tw = (max(fm.horizontalAdvance(txt_t),
-                      fm.horizontalAdvance(txt_o)) + 12)
-            if th <= self.height() - 6 and tw <= W - 6:
+            tw = max(_text_w(font, txt_t), _text_w(font, txt_o)) + 14
+            if th <= win_h - 4 and tw <= win_w - 4:
                 break
             fs -= 1
         p.setFont(QFont("Consolas", fs))
         fm = p.fontMetrics()
         th = int(fm.lineSpacing() * 2 + 6)
-        tw = max(fm.horizontalAdvance(txt_t),
-                 fm.horizontalAdvance(txt_o)) + 12
+        tw = max(_text_w(p.font(), txt_t), _text_w(p.font(), txt_o)) + 14
         # 水平：优先放光标右侧，超出窗口则翻到左侧；整体夹在窗口内避免被裁
         lx = int(cx) + 8
-        if lx + tw > W:
+        if lx + tw > win_w:
             lx = int(cx) - tw - 8
         if lx < 0:
             lx = 0
-        if lx + tw > W:
-            lx = max(0, W - tw)
+        if lx + tw > win_w:
+            lx = max(0, win_w - tw)
         # 垂直：优先放在 K 线「上方」不挡柱；越界则夹到窗口内（用整窗高度，不局限 K 线区）
         ly = int(top_y) - th - 2
         if ly < 0:
             ly = int(bot_y) + 2
-        if ly + th > self.height():
-            ly = max(0, self.height() - th)
+        if ly + th > win_h:
+            ly = max(0, win_h - th)
         p.setBrush(QBrush(PANEL))
         p.setPen(QPen(BORDER, 1))
         p.drawRoundedRect(QRect(lx, ly, tw, th), 4, 4)
